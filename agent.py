@@ -90,12 +90,13 @@ def analyze_material(content, api_key=None):
                 {
                     "role": "system",
                     "content": (
-                        "你是一个素材管理助手。对用户提供的内容,做以下三件事:\n"
-                        "1. 生成3-5个中文标签(以#开头,如 #用户增长 #案例分析)\n"
-                        "2. 写一句50字以内的中文摘要\n"
-                        "3. 判断素材类型(文章/灵感/数据/案例/教程)\n"
+                        "你是一个素材管理助手。对用户提供的内容,做以下四件事:\n"
+                        "1. 生成一个10-20字的标题(提炼核心主题,不要用'一篇关于'开头)\n"
+                        "2. 生成3-5个中文标签(以#开头,如 #用户增长 #案例分析)\n"
+                        "3. 写一句50字以内的中文摘要\n"
+                        "4. 判断素材类型(文章/灵感/数据/案例/教程)\n"
                         "只返回JSON格式,不要任何额外文字。\n"
-                        '例: {"tags":["#Python","#教程"],"summary":"一篇关于Python入门的教程","type":"教程"}'
+                        '例: {"title":"Python列表推导式入门","tags":["#Python","#教程"],"summary":"Python列表推导式是简洁创建列表的方式","type":"教程"}'
                     ),
                 },
                 {"role": "user", "content": content[:4000]},
@@ -192,6 +193,27 @@ def list_materials(db_path="materials.db", limit=50):
     return result
 
 
+def delete_material(material_id, db_path="materials.db"):
+    """根据 ID 删除一条素材(SQLite + Chroma)"""
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM materials WHERE id = ?", (material_id,))
+    conn.commit()
+    conn.close()
+    try:
+        collection = _get_collection()
+        collection.delete(ids=[str(material_id)])
+    except Exception:
+        pass
+    return True
+
+
+def preload():
+    """预热:提前加载向量模型,让后续操作秒响应"""
+    _get_collection()
+    _get_llm_client()
+
+
 # ============================================================
 # 3. 🔍 向量相似检索(新增!)
 # ============================================================
@@ -226,6 +248,10 @@ def search_materials(keyword, top_k=5):
                 "score": round(1 - distances[i], 3) if distances else 0,
             })
 
+    # 过滤低相关度结果(相似度 < 0.25 的不显示)
+    matches = [m for m in matches if m["score"] >= 0.25]
+    matches.sort(key=lambda x: x["score"], reverse=True)
+
     return {"results": matches, "query": keyword}
 
 
@@ -249,8 +275,12 @@ def generate_draft(topic, material_ids=None, db_path="materials.db"):
 
     context = "\n".join(material_briefs)
 
+    llm_client = _get_llm_client()
+    if llm_client is None:
+        return {"error": "请先在 config.py 里填入 DeepSeek API Key"}
+
     try:
-        response = client.chat.completions.create(
+        response = llm_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {
