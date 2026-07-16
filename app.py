@@ -1053,8 +1053,11 @@ elif page == "素材知识库":
         for index, material in enumerate(filtered_materials):
             with columns[index % 2]:
                 st.markdown(make_material_card(material), unsafe_allow_html=True)
-                del_col1, del_col2 = st.columns([3, 1])
-                with del_col2:
+                btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
+                with btn_col2:
+                    if st.button("查看详情", key=f"detail_{material['id']}", use_container_width=True):
+                        st.session_state.detail_material = material
+                with btn_col3:
                     if st.button("删除", key=f"del_{material['id']}", use_container_width=True):
                         try:
                             from agent import delete_material
@@ -1066,6 +1069,31 @@ elif page == "素材知识库":
                             if m.get("id") != material["id"]
                         ]
                         st.rerun()
+
+# 弹窗显示详情
+if st.session_state.get("detail_material"):
+    m = st.session_state.detail_material
+
+    @st.dialog("素材详情")
+    def show_detail():
+        st.markdown(f"### {m.get('title', '未命名')}")
+        tags = m.get("tags", [])
+        if tags:
+            st.markdown(f"**标签:** {' '.join(tags)}")
+        st.markdown(f"**类型:** {m.get('type', '未分类')}")
+        st.markdown(f"**摘要:** {m.get('summary', '')}")
+        st.markdown("---")
+        st.markdown("**完整内容:**")
+        content = m.get("content", "")
+        if content:
+            st.text_area("原文", value=content, height=300, disabled=True, label_visibility="collapsed")
+        else:
+            st.caption("（无详细内容）")
+        if st.button("关闭"):
+            st.session_state.detail_material = None
+            st.rerun()
+
+    show_detail()
 elif page == "智能检索":
     render_page_header(SMART_SEARCH_PAGE_DESCRIPTION)
     render_stats(st.session_state.materials)
@@ -1119,7 +1147,7 @@ elif page == "智能检索":
         for index, material in enumerate(st.session_state.search_results):
             with columns[index % 2]:
                 st.markdown(make_search_result_card(material), unsafe_allow_html=True)
-else:
+elif page == "生成初稿":
     render_page_header(DRAFT_PAGE_DESCRIPTION)
     render_stats(st.session_state.materials)
     st.write("")
