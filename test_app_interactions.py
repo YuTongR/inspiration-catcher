@@ -159,3 +159,24 @@ def test_resolve_search_state_keeps_message_as_error_without_results(monkeypatch
     assert results == []
     assert "没有找到相关素材" in error
     assert notice == ""
+
+def test_library_detail_state_clears_after_leaving_library_page(monkeypatch):
+    monkeypatch.setitem(sys.modules, "agent", build_fake_agent())
+
+    app = load_app_module()
+    app.st.session_state.library_detail_material_id = "1"
+
+    app.sync_library_detail_state("智能检索")
+
+    assert app.st.session_state.library_detail_material_id is None
+
+
+def test_delete_dialog_state_suppresses_detail_dialog_state(monkeypatch):
+    monkeypatch.setitem(sys.modules, "agent", build_fake_agent())
+
+    app = load_app_module()
+
+    detail_id, delete_id = app.resolve_library_modal_state("素材知识库", "1", "2")
+
+    assert detail_id is None
+    assert delete_id == "2"

@@ -1,0 +1,6 @@
+[server]
+folderWatchBlacklist = [
+  ".pytest_tmp",
+  ".worktrees",
+  ".pytest_cache",
+]

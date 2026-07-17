@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
-from datetime import date
+from datetime import date, datetime
 from html import escape
 
 import streamlit as st
@@ -21,20 +21,6 @@ except Exception:
 
 
 st.set_page_config(page_title="灵感捕手", page_icon="🪶", layout="wide")
-
-
-@st.cache_resource
-def _warmup_backend():
-    """启动时预热向量模型和 LLM client,让后续操作秒响应"""
-    try:
-        from agent import preload
-        preload()
-    except Exception:
-        pass
-    return True
-
-
-_warmup_backend()
 
 SEARCH_BACKEND_TIMEOUT_SECONDS = 2
 SEARCH_BACKEND_COOLDOWN_SECONDS = 120
@@ -455,6 +441,9 @@ if "draft_text" not in st.session_state:
 if "quick_note" not in st.session_state:
     st.session_state.quick_note = ""
 
+if "material_title" not in st.session_state:
+    st.session_state.material_title = ""
+
 if "url_input" not in st.session_state:
     st.session_state.url_input = ""
 
@@ -485,12 +474,29 @@ if "generated_draft_refs" not in st.session_state:
 if "generated_draft_error" not in st.session_state:
     st.session_state.generated_draft_error = ""
 
+if "library_detail_material_id" not in st.session_state:
+    st.session_state.library_detail_material_id = None
+
+if "pending_delete_material_id" not in st.session_state:
+    st.session_state.pending_delete_material_id = None
+
 if "page" not in st.session_state:
     st.session_state.page = "存入灵感"
 
 if "search_backend_retry_after" not in st.session_state:
     st.session_state.search_backend_retry_after = 0.0
 
+
+def sync_library_detail_state(page: str) -> None:
+    if page != "素材知识库":
+        st.session_state.library_detail_material_id = None
+
+def resolve_library_modal_state(page: str, detail_id: str | None, delete_id: str | None) -> tuple[str | None, str | None]:
+    if page != "素材知识库":
+        return None, None
+    if delete_id is not None:
+        return None, delete_id
+    return detail_id, None
 
 def infer_tags(text: str) -> list[str]:
     tags = []
@@ -510,26 +516,24 @@ def infer_tags(text: str) -> list[str]:
 def persist_material_payload(payload: dict) -> tuple[bool, str]:
     try:
         from agent import save_material as agent_save_material
-        from agent import analyze_material
     except ImportError:
         return False, "素材库接口暂未接入，请稍后再试。"
     except Exception as exc:
         return False, f"素材库接口加载失败：{exc}"
 
-    # 用 AI 生成更好的标题(标签/摘要/类型保持原有逻辑)
-    content = payload.get("content", "")
-    if content:
-        try:
-            ai_result = analyze_material(content)
-            if "error" not in ai_result and ai_result.get("title"):
-                payload["title"] = ai_result["title"]
-        except Exception:
-            pass  # AI 失败就用原来的
-
     try:
-        saved_id = agent_save_material(payload)
+        saved_result = agent_save_material(payload)
     except Exception as exc:
         return False, f"存入素材库失败：{exc}"
+
+    if isinstance(saved_result, dict):
+        if saved_result.get("error"):
+            return False, str(saved_result["error"])
+        if saved_result.get("duplicate"):
+            return False, str(saved_result.get("message") or "已存在重复素材，未重复入库。")
+        saved_id = saved_result.get("id")
+    else:
+        saved_id = saved_result
 
     fresh_materials = load_materials_from_backend(fallback_to_demo=False)
     if fresh_materials:
@@ -539,26 +543,30 @@ def persist_material_payload(payload: dict) -> tuple[bool, str]:
             {
                 **payload,
                 "id": saved_id,
-                "created_at": str(date.today()),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
         )
         st.session_state.materials = [saved_item, *st.session_state.materials]
 
-    return True, "已成功存入素材库。"
+    return True, "已成功存入素材库，AI 信息会在后台补全。"
 
 
-def save_material(content: str) -> tuple[bool, str]:
+def build_placeholder_title() -> str:
+    return f"未命名素材 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+
+def save_material(title: str, content: str) -> tuple[bool, str]:
     text = content.strip()
     if not text:
         return False, "请先输入一点素材内容。"
 
-    title = text[:18] + ("..." if len(text) > 18 else "")
-    summary = text[:72] + ("..." if len(text) > 72 else "")
+    clean_title = title.strip()
     payload = {
-        "title": title or "未命名素材",
+        "title": clean_title or build_placeholder_title(),
+        "title_source": "user" if clean_title else "fallback",
         "content": text,
         "tags": infer_tags(text),
-        "summary": summary,
+        "summary": text[:72] + ("..." if len(text) > 72 else ""),
         "type": "灵感",
         "source_type": "text",
         "url": "",
@@ -581,7 +589,7 @@ def save_ingested_material(record: dict) -> tuple[bool, str]:
         tags = [tags]
 
     source_type = str(record.get("source_type", "text") or "text")
-    title = str(record.get("title") or (content[:18] + ("..." if len(content) > 18 else ""))).strip()
+    title = str(record.get("title") or "").strip()
     summary_source = str(record.get("summary") or content)
     summary = summary_source[:72] + ("..." if len(summary_source) > 72 else "")
     material_type = record.get("type") or {
@@ -591,7 +599,8 @@ def save_ingested_material(record: dict) -> tuple[bool, str]:
     }.get(source_type, "灵感")
 
     payload = {
-        "title": title or "未命名素材",
+        "title": title or build_placeholder_title(),
+        "title_source": "user" if title else "fallback",
         "content": content,
         "tags": tags,
         "summary": summary,
@@ -677,16 +686,53 @@ def search_materials(query: str) -> tuple[list[dict], str]:
     if time.time() < st.session_state.search_backend_retry_after:
         return fallback_response("向量检索仍在初始化，当前先展示本地关键词匹配结果。")
 
+    script = (
+        "import json; "
+        "from agent import search_materials; "
+        f"result = search_materials({json.dumps(keyword, ensure_ascii=False)}); "
+        "print(json.dumps(result, ensure_ascii=False))"
+    )
+
     try:
-        from agent import search_materials as agent_search
-        raw_results = agent_search(keyword)
-    except Exception as exc:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=SEARCH_BACKEND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        st.session_state.search_backend_retry_after = time.time() + SEARCH_BACKEND_COOLDOWN_SECONDS
         fallback_results = fallback_search()
         if fallback_results:
-            return fallback_results, f"智能检索暂不可用，展示本地匹配结果：{exc}"
-        return [], f"智能检索暂不可用：{exc}"
+            return fallback_results, "向量检索初始化较慢，当前先展示本地关键词匹配结果。"
+        return [], "智能检索初始化较慢，请稍后再试。"
+    except Exception as exc:
+        st.session_state.search_backend_retry_after = time.time() + SEARCH_BACKEND_COOLDOWN_SECONDS
+        fallback_results = fallback_search()
+        if fallback_results:
+            return fallback_results, f"智能检索暂时不可用，当前展示本地关键词匹配结果：{exc}"
+        return [], f"智能检索暂时不可用：{exc}"
+
+    if completed.returncode != 0:
+        st.session_state.search_backend_retry_after = time.time() + SEARCH_BACKEND_COOLDOWN_SECONDS
+        fallback_results = fallback_search()
+        error_text = completed.stderr.strip() or completed.stdout.strip() or "未知错误"
+        if fallback_results:
+            return fallback_results, f"智能检索返回错误，当前展示本地关键词匹配结果：{error_text}"
+        return [], error_text
+
+    try:
+        raw_results = json.loads(completed.stdout.strip()) if completed.stdout.strip() else {}
+    except json.JSONDecodeError:
+        st.session_state.search_backend_retry_after = time.time() + SEARCH_BACKEND_COOLDOWN_SECONDS
+        fallback_results = fallback_search()
+        if fallback_results:
+            return fallback_results, "智能检索返回内容无法解析，当前展示本地关键词匹配结果。"
+        return [], "智能检索返回内容无法解析。"
 
     if isinstance(raw_results, dict) and raw_results.get("error"):
+        st.session_state.search_backend_retry_after = time.time() + SEARCH_BACKEND_COOLDOWN_SECONDS
         fallback_results = fallback_search()
         if fallback_results:
             return fallback_results, f"智能检索返回错误，当前展示本地关键词匹配结果：{raw_results['error']}"
@@ -728,6 +774,94 @@ def resolve_search_state(query: str) -> tuple[list[dict], str, str]:
         return results, "", message
     return results, message, ""
 
+
+def resolve_draft_candidates(topic: str) -> tuple[list[dict], str]:
+    clean_topic = topic.strip()
+    if not clean_topic:
+        return [], ""
+
+    def fallback_candidates() -> list[dict]:
+        matches = []
+        source_materials = load_materials_from_backend(fallback_to_demo=False) or st.session_state.materials
+        for index, item in enumerate(source_materials):
+            score = 0
+            title_text = item.get("title", "")
+            summary_text = item.get("summary", "")
+            content_text = item.get("content", "")
+            tags = item.get("tags", [])
+            if clean_topic in title_text:
+                score += 60
+            if clean_topic in summary_text:
+                score += 25
+            if clean_topic in content_text:
+                score += 18
+            if any(clean_topic in tag for tag in tags):
+                score += 30
+            if score:
+                matches.append(
+                    {
+                        "id": str(item.get("id", f"demo-{index}")),
+                        "title": title_text or f"素材 {index + 1}",
+                        "summary": summary_text or content_text,
+                        "tags": tags,
+                        "type": item.get("type", "未分类"),
+                        "score": score,
+                        "content": content_text,
+                        "url": item.get("url", ""),
+                    }
+                )
+        return sorted(matches, key=lambda row: row["score"], reverse=True)[:8]
+
+    try:
+        from agent import search_materials as agent_search_materials
+    except Exception:
+        fallback = fallback_candidates()
+        return fallback, "" if fallback else "暂时无法匹配相关素材。"
+
+    try:
+        raw_results = agent_search_materials(clean_topic, top_k=8)
+    except Exception as exc:
+        fallback = fallback_candidates()
+        if fallback:
+            return fallback, f"智能匹配暂时不可用，当前先展示本地相关素材：{exc}"
+        return [], f"暂时无法匹配相关素材：{exc}"
+
+    if isinstance(raw_results, dict) and raw_results.get("error"):
+        fallback = fallback_candidates()
+        if fallback:
+            return fallback, f"智能匹配暂时不可用，当前先展示本地相关素材：{raw_results['error']}"
+        return [], f"暂时无法匹配相关素材：{raw_results['error']}"
+
+    result_items = raw_results.get("results", []) if isinstance(raw_results, dict) else (raw_results or [])
+    normalized = []
+    for index, item in enumerate(result_items):
+        if not isinstance(item, dict):
+            continue
+        tags = item.get("tags", [])
+        if isinstance(tags, str):
+            tags = [tags]
+        normalized.append(
+            {
+                "id": str(item.get("id", f"result-{index}")),
+                "title": item.get("title") or f"相关素材 {index + 1}",
+                "summary": item.get("summary") or item.get("content", ""),
+                "tags": tags,
+                "type": item.get("type", "未分类"),
+                "score": item.get("score", "-"),
+                "content": item.get("content", ""),
+                "url": item.get("url", ""),
+            }
+        )
+
+    if normalized:
+        return normalized, ""
+
+    fallback = fallback_candidates()
+    if fallback:
+        return fallback, "当前没有返回向量检索结果，先展示本地相关素材。"
+    return [], "暂时没有匹配到相关素材。"
+
+
 def build_material_selector_items(items: list[dict]) -> list[dict]:
     selector_items = []
     for index, item in enumerate(items):
@@ -739,6 +873,9 @@ def build_material_selector_items(items: list[dict]) -> list[dict]:
                 "summary": item.get("summary", ""),
                 "tags": item.get("tags", []),
                 "type": item.get("type", "未分类"),
+                "score": item.get("score", "-"),
+                "content": item.get("content", ""),
+                "url": item.get("url", ""),
             }
         )
     return selector_items
@@ -879,15 +1016,113 @@ def make_search_result_card(item: dict) -> str:
     """
 
 
-def build_preview(quick_note: str, material_text: str) -> str:
+def build_preview(quick_note: str, material_title: str, material_text: str) -> str:
     sections = []
     if quick_note.strip():
         sections.append(f"主题线索：{escape(quick_note.strip())}")
+    if material_title.strip():
+        sections.append(f"素材标题：{escape(material_title.strip())}")
     if material_text.strip():
         sections.append(escape(material_text.strip()).replace("\n", "<br>"))
     if not sections:
         return "这里会显示你当前输入的灵感预览，方便快速确认要点是否已经记完整。"
     return "<br><br>".join(sections)
+
+def find_material_in_state(material_id: str):
+    for item in st.session_state.materials:
+        if str(item.get("id")) == str(material_id):
+            return item
+    return None
+
+
+def delete_material_from_backend(material_id: str) -> tuple[bool, str]:
+    try:
+        from agent import delete_material as agent_delete_material
+    except ImportError:
+        return False, "删除接口暂未接入。"
+    except Exception as exc:
+        return False, f"删除接口加载失败：{exc}"
+
+    try:
+        deleted = agent_delete_material(int(material_id) if str(material_id).isdigit() else material_id)
+    except Exception as exc:
+        return False, f"删除失败：{exc}"
+
+    if not deleted:
+        return False, "没有找到要删除的素材。"
+
+    st.session_state.materials = [item for item in st.session_state.materials if str(item.get("id")) != str(material_id)]
+    return True, "素材已彻底删除。"
+
+
+def make_material_detail_markup(item: dict) -> str:
+    badges = "".join(
+        f'<span class="material-badge {badge_class_map.get(tag, "badge-custom")}">{escape(tag)}</span>'
+        for tag in item.get("tags", [])
+    )
+    detail_lines = [
+        f'<div class="section-title">{escape(item.get("title", "未命名素材"))}</div>',
+        f'<div class="material-badge-row">{badges}</div>' if badges else "",
+        f'<div class="section-copy"><strong>类型：</strong>{escape(str(item.get("type", "未分类")))}</div>',
+        f'<div class="section-copy"><strong>日期：</strong>{escape(str(item.get("date", "")))}</div>',
+    ]
+    if item.get("url"):
+        detail_lines.append(f'<div class="section-copy"><strong>来源：</strong>{escape(str(item.get("url", "")))}</div>')
+    if item.get("summary"):
+        detail_lines.append(f'<div class="section-copy"><strong>摘要：</strong>{escape(str(item.get("summary", "")))}</div>')
+    detail_lines.append('<div class="section-title">完整内容</div>')
+    detail_lines.append(
+        f'<div class="empty-shell">{escape(str(item.get("content", "") or "暂无完整正文")).replace("\n", "<br>")}</div>'
+    )
+    return "".join(detail_lines)
+
+
+@st.dialog("素材详情")
+def render_material_detail_dialog(material: dict) -> None:
+    st.markdown(make_material_detail_markup(material), unsafe_allow_html=True)
+    if st.button("关闭详情", key=f"close_detail_{material['id']}", use_container_width=True):
+        st.session_state.library_detail_material_id = None
+        st.rerun()
+
+
+@st.dialog("确认删除")
+def render_delete_material_dialog(material: dict) -> None:
+    st.markdown(f"准备彻底删除《{escape(str(material.get('title', '未命名素材')))}》。删除后将同时从素材库和检索索引中移除。")
+    confirm_col, cancel_col = st.columns(2, gap="small")
+    with confirm_col:
+        if st.button("确认删除", key=f"confirm_delete_{material['id']}", type="primary", use_container_width=True):
+            deleted, message = delete_material_from_backend(str(material["id"]))
+            st.session_state.pending_delete_material_id = None
+            if deleted:
+                st.rerun()
+            st.warning(message)
+    with cancel_col:
+        if st.button("取消", key=f"cancel_delete_{material['id']}", use_container_width=True):
+            st.session_state.pending_delete_material_id = None
+            st.rerun()
+
+
+sync_library_detail_state(st.session_state.page)
+(
+    st.session_state.library_detail_material_id,
+    st.session_state.pending_delete_material_id,
+) = resolve_library_modal_state(
+    st.session_state.page,
+    st.session_state.library_detail_material_id,
+    st.session_state.pending_delete_material_id,
+)
+
+detail_material = None
+if st.session_state.library_detail_material_id is not None:
+    detail_material = find_material_in_state(st.session_state.library_detail_material_id)
+if detail_material is not None:
+    render_material_detail_dialog(detail_material)
+
+pending_delete_material = None
+if st.session_state.pending_delete_material_id is not None:
+    pending_delete_material = find_material_in_state(st.session_state.pending_delete_material_id)
+if pending_delete_material is not None:
+    render_delete_material_dialog(pending_delete_material)
 
 
 with st.sidebar:
@@ -919,12 +1154,12 @@ if page == "存入灵感":
     left_col, right_col = st.columns([1.55, 0.82], gap="large")
 
     with left_col:
-        st.markdown('<div class="quick-capture-input">场景标签</div>', unsafe_allow_html=True)
+        st.markdown('<div class="quick-capture-input">素材标题</div>', unsafe_allow_html=True)
         st.text_input(
-            "快速定位",
-            key="quick_note",
+            "素材标题",
+            key="material_title",
             label_visibility="collapsed",
-            placeholder="例如：婚礼当天、童年夏夜、旧照片、第一次远行",
+            placeholder="例如：奶奶在院子门口等家人回来",
         )
 
         text_tab, url_tab, image_tab = st.tabs(["粘贴文字", "输入 URL", "上传图片"])
@@ -932,23 +1167,22 @@ if page == "存入灵感":
         with text_tab:
             st.markdown('<div class="section-title">存入一段灵感碎片</div>', unsafe_allow_html=True)
             st.markdown(
-                '<div class="section-copy">先把原话、场景、情绪和细节收进来，不必整理成正式文章。越接近真实语气，后续整理和生成就越自然。</div>',
+                '<div class="section-copy">先写标题，再把原话、场景、情绪和细节收进来。提交后会先快速入库，AI 信息稍后自动补全。</div>',
                 unsafe_allow_html=True,
             )
             material_text = st.text_area(
                 "请输入灵感碎片",
                 key="draft_text",
                 label_visibility="collapsed",
-                height=320,
+                height=368,
                 placeholder="例如：奶奶说她年轻时最喜欢傍晚坐在院子门口等家里人回来，那时候风里有稻谷味，远处还能听见收音机。",
             )
 
             if st.button("存入素材库", key="save_text_material_button", type="primary", use_container_width=True):
                 if material_text.strip():
-                    saved, message = save_material(material_text)
+                    saved, message = save_material(st.session_state.material_title, material_text)
                     if saved:
-                        st.session_state.save_flash = {"ok": True, "msg": message}
-                        st.rerun()
+                        st.success(message)
                     else:
                         st.warning(message)
                 else:
@@ -969,8 +1203,7 @@ if page == "存入灵感":
             if st.button("抓取并存入素材库", key="save_url_material_button", use_container_width=True):
                 saved, message = ingest_url_material(st.session_state.url_input)
                 if saved:
-                    st.session_state.save_flash = {"ok": True, "msg": message}
-                    st.rerun()
+                    st.success(message)
                 else:
                     st.warning(message)
 
@@ -991,8 +1224,7 @@ if page == "存入灵感":
             if st.button("OCR并存入素材库", key="save_image_material_button", use_container_width=True):
                 saved, message = ingest_uploaded_image(uploaded_image)
                 if saved:
-                    st.session_state.save_flash = {"ok": True, "msg": message}
-                    st.rerun()
+                    st.success(message)
                 else:
                     st.warning(message)
 
@@ -1000,29 +1232,21 @@ if page == "存入灵感":
         st.markdown(
             make_info_panel(
                 "输入建议",
-                "优先保留人物称呼、原话语气、动作细节和具体场景，让后续整理出的内容更有辨识度和温度。",
+                "标题尽量写成可识别的主题句，正文尽量保留人物称呼、动作细节和场景层次，后续 AI 整理会更准确。",
             ),
             unsafe_allow_html=True,
         )
         st.markdown(
             make_info_panel(
-                "推荐素材",
-                "第一次远行、家里饭桌、婚礼片段、旧照片背后的故事、夏天夜晚和老手艺回忆，都是很适合先收录的灵感起点。",
+                "录入速度",
+                "现在文本素材会先快速入库，再在后台补齐 AI 标题、摘要和标签，避免保存时长时间等待。",
             ),
             unsafe_allow_html=True,
         )
         st.markdown(
-            make_info_panel("当前预览", build_preview(st.session_state.quick_note, st.session_state.draft_text)),
+            make_info_panel("当前预览", build_preview(st.session_state.quick_note, st.session_state.material_title, st.session_state.draft_text)),
             unsafe_allow_html=True,
         )
-
-        if st.session_state.get("save_flash"):
-            flash = st.session_state.pop("save_flash")
-            if flash["ok"]:
-                st.success(flash["msg"])
-            else:
-                st.warning(flash["msg"])
-
 elif page == "素材知识库":
     render_page_header(LIBRARY_PAGE_DESCRIPTION)
     render_stats(st.session_state.materials)
@@ -1039,7 +1263,7 @@ elif page == "素材知识库":
     filtered_materials = []
     for item in st.session_state.materials:
         tag_match = not selected_tags or any(tag in item.get("tags", []) for tag in selected_tags)
-        text_match = not keyword.strip() or keyword.strip() in f"{item['title']} {item['summary']}"
+        text_match = not keyword.strip() or keyword.strip() in f"{item['title']} {item['summary']} {item.get('content', '')}"
         if tag_match and text_match:
             filtered_materials.append(item)
 
@@ -1053,18 +1277,14 @@ elif page == "素材知识库":
         for index, material in enumerate(filtered_materials):
             with columns[index % 2]:
                 st.markdown(make_material_card(material), unsafe_allow_html=True)
-                del_col1, del_col2 = st.columns([3, 1])
-                with del_col2:
-                    if st.button("删除", key=f"del_{material['id']}", use_container_width=True):
-                        try:
-                            from agent import delete_material
-                            delete_material(material["id"])
-                        except Exception:
-                            pass
-                        st.session_state.materials = [
-                            m for m in st.session_state.materials
-                            if m.get("id") != material["id"]
-                        ]
+                detail_col, delete_col = st.columns(2, gap="small")
+                with detail_col:
+                    if st.button("查看详情", key=f"detail_{material['id']}", use_container_width=True):
+                        st.session_state.library_detail_material_id = str(material["id"])
+                        st.rerun()
+                with delete_col:
+                    if st.button("删除", key=f"delete_{material['id']}", use_container_width=True):
+                        st.session_state.pending_delete_material_id = str(material["id"])
                         st.rerun()
 elif page == "智能检索":
     render_page_header(SMART_SEARCH_PAGE_DESCRIPTION)
@@ -1124,12 +1344,9 @@ else:
     render_stats(st.session_state.materials)
     st.write("")
 
-    selector_items = build_material_selector_items(st.session_state.materials)
-    selector_lookup = {item["id"]: item for item in selector_items}
-
     st.markdown('<div class="section-title">生成一篇主题初稿</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-copy">输入一个明确主题，系统自动推荐相关素材，勾选后生成文章草稿。</div>',
+        '<div class="section-copy">先输入一个明确主题，系统会自动匹配相关素材。你只需要在相关候选里勾选要使用的内容，不再从整个素材库里手动翻找。</div>',
         unsafe_allow_html=True,
     )
 
@@ -1139,30 +1356,39 @@ else:
         placeholder="例如：AI 如何改变教育",
     )
 
-    # 根据主题自动推荐相关素材
-    topic = st.session_state.draft_topic.strip()
-    if topic:
-        try:
-            from agent import search_materials
-            search_result = search_materials(topic)
-            recommended_ids = {str(r["id"]) for r in search_result.get("results", []) if r.get("score", 0) >= 0.2}
-        except Exception:
-            recommended_ids = set()
-        options = [mid for mid in selector_lookup if mid in recommended_ids]
-        if not options:
-            options = list(selector_lookup.keys())
-        placeholder_text = f"已根据主题推荐 {len(options)} 条相关素材"
-    else:
-        options = list(selector_lookup.keys())
-        placeholder_text = "请先输入主题，系统会智能推荐相关素材"
+    selector_lookup = {}
+    candidate_items = []
+    candidate_error = ""
 
-    st.multiselect(
-        "选择要使用的素材",
-        options=options,
-        format_func=lambda item_id: f"{selector_lookup[item_id]['title']} | {selector_lookup[item_id]['summary']}",
-        key="draft_selected_ids",
-        placeholder=placeholder_text,
-    )
+    if st.session_state.draft_topic.strip():
+        candidate_items, candidate_error = resolve_draft_candidates(st.session_state.draft_topic)
+        selector_items = build_material_selector_items(candidate_items)
+        selector_lookup = {item["id"]: item for item in selector_items}
+        valid_ids = set(selector_lookup.keys())
+        st.session_state.draft_selected_ids = [item_id for item_id in st.session_state.draft_selected_ids if item_id in valid_ids]
+
+        if candidate_error:
+            st.info(candidate_error)
+
+        if selector_lookup:
+            st.caption(f"已匹配到 {len(selector_lookup)} 条相关素材")
+            st.multiselect(
+                "选择要使用的素材",
+                options=list(selector_lookup.keys()),
+                format_func=lambda item_id: f"{selector_lookup[item_id]['title']} | {selector_lookup[item_id]['summary']}",
+                key="draft_selected_ids",
+                placeholder="勾选 1 条或多条相关素材",
+            )
+        else:
+            st.markdown(
+                '<div class="empty-shell">当前主题下还没有匹配到相关素材。你可以换一个主题，或者先继续补充素材。</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            '<div class="empty-shell">先输入一个初稿主题，系统再从素材库里匹配最相关的候选素材。</div>',
+            unsafe_allow_html=True,
+        )
 
     if st.button("生成初稿", use_container_width=True):
         (
@@ -1182,7 +1408,7 @@ else:
         )
     elif not st.session_state.generated_draft:
         st.markdown(
-            '<div class="empty-shell">这里会展示生成后的文章初稿。先输入主题、选择素材，再点击“生成初稿”。</div>',
+            '<div class="empty-shell">这里会展示生成后的文章初稿。先输入主题、匹配相关素材并完成勾选，再点击“生成初稿”。</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -1195,8 +1421,5 @@ else:
 
         if st.button("复制初稿", key="copy_draft_button", use_container_width=True):
             st.code(st.session_state.generated_draft, language="markdown")
-
-
-
 
 
