@@ -290,7 +290,7 @@ def parse_image(image_path: str, ocr_api_key: str = None, baidu_config: dict = N
                 'language': 'chs',
                 'isOverlayRequired': 'false'
             }
-            headers = {'apikey': ocr_api_key or 'K89387098088957'}
+            headers = {'apikey': ocr_api_key or ''}
 
             response = requests.post(url, data=payload, headers=headers, timeout=60)
             response.raise_for_status()
